@@ -169,8 +169,11 @@ class StorageBackendFactory:
             backend = backend_class(storage_config, mem_pool_host)
             return backend
         elif backend_name == "hf3fs":
+            is_logical_anchor = getattr(mem_pool_host, "kv_buffer", False) is None
             # Calculate bytes_per_page based on memory pool layout
-            if mem_pool_host.layout in ["page_first", "page_first_direct"]:
+            if is_logical_anchor:
+                bytes_per_page = 0
+            elif mem_pool_host.layout in ["page_first", "page_first_direct"]:
                 bytes_per_page = (
                     mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
                 )
@@ -180,7 +183,12 @@ class StorageBackendFactory:
                 )
 
             dtype = mem_pool_host.dtype
-            return backend_class.from_env_config(bytes_per_page, dtype, storage_config)
+            return backend_class.from_env_config(
+                bytes_per_page,
+                dtype,
+                storage_config,
+                is_logical_anchor=is_logical_anchor,
+            )
         elif backend_name == "eic":
             return backend_class(storage_config, mem_pool_host)
         elif backend_name == "simm":

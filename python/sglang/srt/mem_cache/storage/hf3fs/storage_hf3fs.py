@@ -201,6 +201,7 @@ class HiCacheHF3FS(HiCacheStorage):
         is_page_first_layout: bool = False,
         use_mock_client: bool = False,
         enable_storage_metrics: bool = False,
+        is_logical_anchor: bool = False,
     ):
         self.rank = rank
         self.file_path = file_path
@@ -216,8 +217,16 @@ class HiCacheHF3FS(HiCacheStorage):
         self.is_page_first_layout = is_page_first_layout
         self.enable_storage_metrics = enable_storage_metrics
         self.use_mock_client = use_mock_client
-        self.numel = self.bytes_per_page // self.dtype.itemsize
-        self.num_pages = self.file_size // self.bytes_per_page
+        self._is_logical_anchor = is_logical_anchor
+        if self._is_logical_anchor:
+            # Hybrid models such as DeepSeek-V4 use a KV anchor that owns only
+            # logical page indices. Physical data is stored by the v2 side
+            # pools, so the anchor needs neither file pages nor metadata.
+            self.numel = 0
+            self.num_pages = 0
+        else:
+            self.numel = self.bytes_per_page // self.dtype.itemsize
+            self.num_pages = self.file_size // self.bytes_per_page
         self.skip_backup = False
         if self.is_mla_model and self.rank != 0:
             self.skip_backup = True
@@ -234,22 +243,27 @@ class HiCacheHF3FS(HiCacheStorage):
         )
 
         self.ac = AtomicCounter(self.numjobs)
-        self.clients = [
-            create_hf3fs_client(
-                self.file_path,
-                self.file_size,
-                self.bytes_per_page,
-                self.entries,
-                self.client_timeout,
-                use_mock_client,
-            )
-            for _ in range(numjobs)
-        ]
+        self.clients = (
+            []
+            if self._is_logical_anchor
+            else [
+                create_hf3fs_client(
+                    self.file_path,
+                    self.file_size,
+                    self.bytes_per_page,
+                    self.entries,
+                    self.client_timeout,
+                    use_mock_client,
+                )
+                for _ in range(numjobs)
+            ]
+        )
         self.executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=self.numjobs, thread_name_prefix=f"HiCacheHF3FS-Rank{self.rank}"
         )
 
-        self.metadata_client.initialize(self.rank, self.num_pages)
+        if not self._is_logical_anchor:
+            self.metadata_client.initialize(self.rank, self.num_pages)
         self.lock = threading.RLock()
         self._pool_storage_ctx: dict = {}
 
@@ -269,6 +283,7 @@ class HiCacheHF3FS(HiCacheStorage):
         bytes_per_page: int,
         dtype: torch.dtype,
         storage_config: HiCacheStorageConfig = None,
+        is_logical_anchor: bool = False,
     ) -> "HiCacheHF3FS":
         """Create a HiCacheHF3FS instance from environment configuration.
 
@@ -322,6 +337,7 @@ class HiCacheHF3FS(HiCacheStorage):
                 metadata_client=Hf3fsLocalMetadataClient(),
                 is_page_first_layout=is_page_first_layout,
                 use_mock_client=use_mock_client,
+                is_logical_anchor=is_logical_anchor,
             )
 
         try:
@@ -374,6 +390,7 @@ class HiCacheHF3FS(HiCacheStorage):
             is_page_first_layout=is_page_first_layout,
             use_mock_client=use_mock_client,
             enable_storage_metrics=storage_config.enable_storage_metrics,
+            is_logical_anchor=is_logical_anchor,
         )
 
     def _batch_get(
@@ -534,7 +551,8 @@ class HiCacheHF3FS(HiCacheStorage):
 
     def clear(self) -> None:
         try:
-            self.metadata_client.clear(self.rank)
+            if not self._is_logical_anchor:
+                self.metadata_client.clear(self.rank)
             for ctx in getattr(self, "_pool_storage_ctx", {}).values():
                 self.metadata_client.clear(self.rank, namespace=ctx.namespace)
             logger.info(f"Cleared HiCacheHF3FS for rank {self.rank}")
@@ -567,6 +585,12 @@ class HiCacheHF3FS(HiCacheStorage):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+        if self._is_logical_anchor:
+            self.is_zero_copy = False
+            self.mha_zero_copy = False
+            logger.info("Registered logical KV anchor; HF3FS data lives in side pools")
+            return
+
         self.is_zero_copy = self.mem_pool_host.layout in [
             "page_first",
             "page_first_direct",
@@ -580,8 +604,8 @@ class HiCacheHF3FS(HiCacheStorage):
             return
         super().register_mem_host_pool_v2(host_pool, host_pool_name)
 
-        pool_page_size = getattr(host_pool, "page_size", 1) or 1
-        pool_bytes_per_page = host_pool.get_ksize_per_token() * pool_page_size
+        page_template = host_pool.get_dummy_flat_data_page()
+        pool_bytes_per_page = page_template.numel() * page_template.element_size()
         pool_num_pages = self.file_size // pool_bytes_per_page
         pool_file_path = f"{self.file_path}.{host_pool_name}"
         namespace = host_pool_name  # e.g. PoolName.MAMBA, PoolName.INDEXER
@@ -679,7 +703,12 @@ class HiCacheHF3FS(HiCacheStorage):
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
-        kv_pages = self.batch_exists(keys, extra_info)
+        if self._is_logical_anchor:
+            # There is no physical KV object for a logical anchor. Required
+            # side pools below determine the usable storage prefix.
+            kv_pages = len(keys)
+        else:
+            kv_pages = self.batch_exists(keys, extra_info)
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
         final_pages = kv_pages
@@ -885,6 +914,9 @@ class HiCacheHF3FS(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        if self._is_logical_anchor:
+            return [True] * len(keys)
+
         keys, values = self._batch_get_preprocess(keys, host_indices)
         results = self._batch_get(keys, values)
         return self._batch_get_postprocess(host_indices, values, results)
@@ -912,7 +944,9 @@ class HiCacheHF3FS(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        len_keys = len(keys)
+        if self._is_logical_anchor:
+            return [True] * len(keys)
+
         keys, values = self._batch_set_preprocess(keys, host_indices)
         results = self._batch_set(keys, values)
         return results
